@@ -6,6 +6,7 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from collections import defaultdict
+
 st.set_page_config(page_title="BOM Tree", layout="wide", page_icon="⚙️")
 
 DB = os.path.join(os.path.dirname(__file__), "bom.db")
@@ -115,7 +116,8 @@ def do_import(uploaded, col_map, skip_rows, sheet):
 @st.cache_data
 def load_parts(import_id):
     rows = get_db().execute(
-        "SELECT * FROM parts WHERE import_id=? ORDER BY row_no", (import_id,)
+        "SELECT row_no, lv, amat_code, fv_code, fv_rev, amat_rev, part_name, status "
+        "FROM parts WHERE import_id=? ORDER BY row_no", (import_id,)
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -127,51 +129,38 @@ def list_imports():
         "GROUP BY i.id ORDER BY i.id DESC"
     ).fetchall()]
 
-# ── Build child/parent maps from flat parts ───────────────────────────────────
 @st.cache_data
 def get_optimized_maps(import_id):
-    # Load only the essential columns for tree building
     db = get_db()
-    cursor = db.execute(
-        "SELECT amat_code, amat_parent FROM parts WHERE import_id=?", 
+    rows = db.execute(
+        "SELECT amat_code, lv FROM parts WHERE import_id=? ORDER BY row_no",
         (import_id,)
-    )
-    
+    ).fetchall()
     children_map = defaultdict(list)
-    parents_map = defaultdict(list)
-    
-    for row in cursor.fetchall():
-        child = str(row["amat_code"]).strip()
-        parent = str(row["amat_parent"]).strip()
-        
-        if parent and parent not in ("-", "None", "nan", ""):
-            if child not in children_map[parent]:
-                children_map[parent].append(child)
-            if parent not in parents_map[child]:
-                parents_map[child].append(parent)
-                
+    parents_map  = defaultdict(list)
+    stack = []
+    for row in rows:
+        code = str(row["amat_code"]).strip()
+        lv   = int(row["lv"] or 0)
+        while stack and stack[-1][0] >= lv:
+            stack.pop()
+        if stack:
+            parent = stack[-1][1]
+            if code not in children_map[parent]:
+                children_map[parent].append(code)
+            if parent not in parents_map[code]:
+                parents_map[code].append(parent)
+        stack.append((lv, code))
     return dict(children_map), dict(parents_map)
 
 def build_tree(node, lookup, visited=None):
-    if visited is None:
-        visited = set()
-    
-    # Fast circular reference check
+    if visited is None: visited = set()
     if node in visited:
         return {"id": node, "children": [], "circular": True}
-    
     visited.add(node)
-    
-    # Build children using the pre-computed dictionary
-    return {
-        "id": node,
-        "children": [
-            build_tree(child, lookup, visited.copy()) 
-            for child in lookup.get(node, [])
-        ]
-    }
+    return {"id": node, "children": [build_tree(c, lookup, visited.copy()) for c in lookup.get(node, [])]}
 
-# ── Export ────────────────────────────────────────────────────────────────────
+# ── Exports ───────────────────────────────────────────────────────────────────
 def export_excel(import_id):
     db = get_db()
     imp = dict(db.execute("SELECT * FROM imports WHERE id=?", (import_id,)).fetchone())
@@ -201,64 +190,82 @@ def export_excel(import_id):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf, imp['filename']+'_export.xlsx'
 
-# ── D3 tree HTML (same pattern as original working code) ─────────────────────
+def export_tree_excel(part, tree_data, direction):
+    rows = []
+    def walk(node, depth=0):
+        rows.append({'Level': depth, 'Part': node['id'], 'Note': '⚠ circular' if node.get('circular') else ''})
+        for child in node.get('children', []):
+            walk(child, depth + 1)
+    walk(tree_data)
+    wb = Workbook(); ws = wb.active; ws.title = part[:20]
+    hf = PatternFill("solid", fgColor="FF1565C0")
+    thin = Side(style='thin', color='FFB0BEC5')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    lv_colors = ['FFF9A825','FFFFF9C4','FFF1F8E9','FFE8F5E9','FFEDE7F6']
+    ws.append(['Level', 'Part Number', 'Note'])
+    for cell in ws[1]:
+        cell.fill=hf; cell.font=Font(bold=True,color="FFFFFFFF",size=10)
+        cell.alignment=Alignment(horizontal='center'); cell.border=border
+    ws.column_dimensions['A'].width = 8
+    ws.column_dimensions['B'].width = 40
+    ws.column_dimensions['C'].width = 14
+    for r in rows:
+        lv = r['Level']
+        fill = PatternFill("solid", fgColor=lv_colors[min(lv, 4)])
+        ws.append([lv, r['Part'], r['Note']])
+        for cell in ws[ws.max_row]:
+            cell.fill=fill; cell.border=border
+            if cell.column == 2:
+                cell.alignment = Alignment(indent=lv, vertical='center')
+    ws.freeze_panes = 'A2'
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf
+
+def export_tree_text(part, tree_data, direction):
+    lines = [f"BOM Tree — {part} — {direction}", '='*50]
+    lines.append(part)
+    def walk(node, prefix='', is_last=True):
+        connector = '└── ' if is_last else '├── '
+        flag = ' ⚠ circular' if node.get('circular') else ''
+        lines.append(prefix + connector + node['id'] + flag)
+        children = node.get('children', [])
+        for i, child in enumerate(children):
+            walk(child, prefix + ('    ' if is_last else '│   '), i == len(children) - 1)
+    for i, child in enumerate(tree_data.get('children', [])):
+        walk(child, '', i == len(tree_data.get('children', [])) - 1)
+    return '\n'.join(lines)
+
+# ── D3 HTML ───────────────────────────────────────────────────────────────────
 def make_tree_html(part, direction, tree_json):
     dir_label = "↓ Explosion" if direction == "explosion" else "↑ Where Used"
     return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
+<html><head><meta charset="utf-8">
 <style>
-  :root {{
-    --bg:#0d0f14; --surface:#151820; --border:#252a36;
-    --accent:#4fffb0; --accent2:#7c6fff;
-    --text:#e8eaf0; --muted:#5a6070; --warn:#ff6b6b;
-  }}
-  * {{ box-sizing:border-box; margin:0; padding:0; }}
-  html,body {{ width:100%; height:100%; background:var(--bg); color:var(--text);
-    font-family:'Segoe UI',monospace,sans-serif; overflow:hidden; }}
-  #toolbar {{
-    position:absolute; top:0; left:0; right:0; height:46px;
-    background:var(--surface); border-bottom:1px solid var(--border);
-    display:flex; align-items:center; gap:10px; padding:0 16px; z-index:10;
-  }}
-  .root-badge {{ background:var(--accent); color:#000; font-family:monospace;
-    font-size:13px; font-weight:700; padding:3px 10px; border-radius:4px; }}
-  .dir-badge {{ background:var(--accent2); color:#fff; font-size:11px;
-    font-weight:700; padding:3px 9px; border-radius:4px; text-transform:uppercase; }}
-  .tbtn {{ background:var(--border); color:var(--text); border:1px solid var(--border);
-    font-size:11px; font-weight:600; padding:4px 12px; border-radius:4px;
-    cursor:pointer; transition:all .15s; font-family:monospace; }}
-  .tbtn:hover {{ background:var(--accent); color:#000; border-color:var(--accent); }}
-  #stats {{ margin-left:auto; font-family:monospace; font-size:11px; color:var(--muted); }}
-  #chart {{ position:absolute; top:46px; left:0; right:0; bottom:0; overflow:hidden; }}
-  #chart svg {{
-    background-image: linear-gradient(var(--border) 1px, transparent 1px),
-      linear-gradient(90deg, var(--border) 1px, transparent 1px);
-    background-size: 40px 40px;
-  }}
-  .node circle {{ stroke-width:2px; transition:r .2s,fill .2s; cursor:pointer; }}
-  .node circle:hover {{ r:9; }}
-  .node.root circle  {{ fill:var(--accent); stroke:#fff; r:10; }}
-  .node.leaf circle  {{ fill:var(--bg); stroke:var(--accent2); }}
-  .node.inner circle {{ fill:var(--surface); stroke:var(--accent); }}
-  .node.collapsed circle {{ fill:var(--accent2); stroke:var(--accent2); }}
-  .node.circular circle {{ fill:var(--warn); stroke:var(--warn); }}
-  .node text {{ font-family:monospace; font-size:11px; fill:var(--text);
-    pointer-events:none; dominant-baseline:middle; }}
-  .node.root text {{ font-weight:700; font-size:13px; fill:var(--accent); }}
-  .link {{ fill:none; stroke:var(--border); stroke-width:1.5px; }}
-  #tooltip {{
-    position:absolute; pointer-events:none; background:var(--surface);
-    border:1px solid var(--accent); border-radius:6px; padding:8px 14px;
-    font-family:monospace; font-size:12px; color:var(--text);
-    box-shadow:0 4px 20px rgba(0,0,0,.5); display:none; z-index:20;
-  }}
-  #tooltip .tp {{ font-weight:700; color:var(--accent); font-size:13px; }}
-  #tooltip .tm {{ color:var(--muted); margin-top:4px; font-size:11px; }}
-</style>
-</head>
-<body>
+  :root {{--bg:#0d0f14;--surface:#151820;--border:#252a36;--accent:#4fffb0;--accent2:#7c6fff;--text:#e8eaf0;--muted:#5a6070;--warn:#ff6b6b;}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  html,body{{width:100%;height:100%;background:var(--bg);color:var(--text);font-family:monospace,sans-serif;overflow:hidden}}
+  #toolbar{{position:absolute;top:0;left:0;right:0;height:46px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;padding:0 16px;z-index:10}}
+  .root-badge{{background:var(--accent);color:#000;font-size:13px;font-weight:700;padding:3px 10px;border-radius:4px}}
+  .dir-badge{{background:var(--accent2);color:#fff;font-size:11px;font-weight:700;padding:3px 9px;border-radius:4px;text-transform:uppercase}}
+  .tbtn{{background:var(--border);color:var(--text);border:1px solid var(--border);font-size:11px;font-weight:600;padding:4px 12px;border-radius:4px;cursor:pointer;transition:all .15s}}
+  .tbtn:hover{{background:var(--accent);color:#000;border-color:var(--accent)}}
+  #stats{{margin-left:auto;font-size:11px;color:var(--muted)}}
+  #chart{{position:absolute;top:46px;left:0;right:0;bottom:0;overflow:hidden}}
+  #chart svg{{background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px}}
+  .node circle{{stroke-width:2px;transition:r .2s,fill .2s;cursor:pointer}}
+  .node circle:hover{{r:9}}
+  .node.root circle{{fill:var(--accent);stroke:#fff;r:10}}
+  .node.leaf circle{{fill:var(--bg);stroke:var(--accent2)}}
+  .node.inner circle{{fill:var(--surface);stroke:var(--accent)}}
+  .node.collapsed circle{{fill:var(--accent2);stroke:var(--accent2)}}
+  .node.circular circle{{fill:var(--warn);stroke:var(--warn)}}
+  .node text{{font-family:monospace;font-size:11px;fill:var(--text);pointer-events:none;dominant-baseline:middle}}
+  .node.root text{{font-weight:700;font-size:13px;fill:var(--accent)}}
+  .link{{fill:none;stroke:var(--border);stroke-width:1.5px}}
+  #tooltip{{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:8px 14px;font-size:12px;color:var(--text);box-shadow:0 4px 20px rgba(0,0,0,.5);display:none;z-index:20}}
+  #tooltip .tp{{font-weight:700;color:var(--accent);font-size:13px}}
+  #tooltip .tm{{color:var(--muted);margin-top:4px;font-size:11px}}
+</style></head><body>
 <div id="toolbar">
   <span class="root-badge">{part}</span>
   <span class="dir-badge">{dir_label}</span>
@@ -272,134 +279,73 @@ def make_tree_html(part, direction, tree_json):
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
 const RAW = {tree_json};
-const W = window.innerWidth, H = window.innerHeight - 46;
-const DUR = 300;
-
-function toH(node) {{
-  return {{
-    id: node.id, circular: node.circular||false,
-    _children: node.children && node.children.length ? node.children.map(toH) : null,
-    children: null,
-  }};
-}}
+const W = window.innerWidth, H = window.innerHeight - 46, DUR = 300;
+function toH(n){{ return {{id:n.id,circular:n.circular||false,_children:n.children&&n.children.length?n.children.map(toH):null,children:null}}; }}
 const rootData = toH(RAW);
-if(rootData._children) {{ rootData.children=rootData._children; rootData._children=null; }}
-
-const root = d3.hierarchy(rootData, d=>d.children);
-root.x0 = H/2; root.y0 = 0;
-
-const svg = d3.select("#chart").append("svg").attr("width",W).attr("height",H);
-const zoom = d3.zoom().scaleExtent([0.1,4])
-  .on("zoom", e => g.attr("transform", e.transform));
+if(rootData._children){{rootData.children=rootData._children;rootData._children=null;}}
+const root = d3.hierarchy(rootData,d=>d.children);
+root.x0=H/2;root.y0=0;
+const svg=d3.select("#chart").append("svg").attr("width",W).attr("height",H);
+const zoom=d3.zoom().scaleExtent([0.1,4]).on("zoom",e=>g.attr("transform",e.transform));
 svg.call(zoom);
-const g = svg.append("g").attr("transform",`translate(80,${{H/2}})`);
-const linkPath = d3.linkHorizontal().x(d=>d.y).y(d=>d.x);
-const treeLayout = d3.tree().nodeSize([26, 240]);
-
-let nid = 0;
-function assignIds(d) {{
-  if(!d.data._uid) d.data._uid = ++nid;
-  if(d.children) d.children.forEach(assignIds);
-}}
+const g=svg.append("g").attr("transform",`translate(80,${{H/2}})`);
+const linkPath=d3.linkHorizontal().x(d=>d.y).y(d=>d.x);
+const treeLayout=d3.tree().nodeSize([26,240]);
+let nid=0;
+function assignIds(d){{if(!d.data._uid)d.data._uid=++nid;if(d.children)d.children.forEach(assignIds);}}
 assignIds(root);
-
-const tip = document.getElementById("tooltip");
-
-function update(src) {{
+const tip=document.getElementById("tooltip");
+function update(src){{
   treeLayout(root);
-  let total=0, exp=0;
-  root.each(d=>{{ total++; if(d.children) exp++; }});
-  document.getElementById("stats").textContent = `${{total}} nodes · ${{exp}} expanded`;
-
-  const nodes = root.descendants();
-  const links = root.links();
-
-  // links
-  const link = g.selectAll(".link").data(links, d=>d.target.data._uid);
+  let total=0,exp=0;root.each(d=>{{total++;if(d.children)exp++;}});
+  document.getElementById("stats").textContent=`${{total}} nodes · ${{exp}} expanded`;
+  const nodes=root.descendants(),links=root.links();
+  const link=g.selectAll(".link").data(links,d=>d.target.data._uid);
   link.enter().insert("path","g").attr("class","link")
-    .attr("d",()=>{{ const o={{x:src.x0,y:src.y0}}; return linkPath({{source:o,target:o}}); }})
+    .attr("d",()=>{{const o={{x:src.x0,y:src.y0}};return linkPath({{source:o,target:o}});}})
     .merge(link).transition().duration(DUR).attr("d",linkPath);
-  link.exit().transition().duration(DUR)
-    .attr("d",()=>{{ const o={{x:src.x,y:src.y}}; return linkPath({{source:o,target:o}}); }})
-    .remove();
-
-  // nodes
-  const node = g.selectAll(".node").data(nodes, d=>d.data._uid);
-  const nodeEnter = node.enter().append("g")
-    .attr("class", d=>nclass(d))
-    .attr("transform",`translate(${{src.y0}},${{src.x0}})`)
-    .style("opacity",0)
-    .on("click",(e,d)=>{{ toggle(d); update(d); }})
+  link.exit().transition().duration(DUR).attr("d",()=>{{const o={{x:src.x,y:src.y}};return linkPath({{source:o,target:o}});}}).remove();
+  const node=g.selectAll(".node").data(nodes,d=>d.data._uid);
+  const ne=node.enter().append("g").attr("class",d=>nc(d))
+    .attr("transform",`translate(${{src.y0}},${{src.x0}})`).style("opacity",0)
+    .on("click",(e,d)=>{{toggle(d);update(d);}})
     .on("mousemove",(e,d)=>{{
-      const kids=(d.data._children?.length||0)+(d.data.children?.length||0);
-      tip.innerHTML=`<div class="tp">${{d.data.id}}</div>
-        <div class="tm">depth ${{d.depth}} · ${{kids}} children</div>
-        <div class="tm">${{d.data.circular?"⚠ circular":d.data.children?"click to collapse":d.data._children?"click to expand":"leaf"}}</div>`;
-      tip.style.display="block";
-      tip.style.left=(e.pageX+14)+"px"; tip.style.top=(e.pageY-14)+"px";
-    }})
-    .on("mouseleave",()=>tip.style.display="none");
-
-  nodeEnter.append("circle").attr("r",7);
-  nodeEnter.append("text")
-    .attr("dy","0.31em")
-    .attr("x", d=>(d.data.children||d.data._children)?-14:14)
-    .attr("text-anchor", d=>(d.data.children||d.data._children)?"end":"start")
+      const k=(d.data._children?.length||0)+(d.data.children?.length||0);
+      tip.innerHTML=`<div class="tp">${{d.data.id}}</div><div class="tm">depth ${{d.depth}} · ${{k}} children</div><div class="tm">${{d.data.circular?"⚠ circular":d.data.children?"click to collapse":d.data._children?"click to expand":"leaf"}}</div>`;
+      tip.style.display="block";tip.style.left=(e.pageX+14)+"px";tip.style.top=(e.pageY-14)+"px";
+    }}).on("mouseleave",()=>tip.style.display="none");
+  ne.append("circle").attr("r",7);
+  ne.append("text").attr("dy","0.31em")
+    .attr("x",d=>(d.data.children||d.data._children)?-14:14)
+    .attr("text-anchor",d=>(d.data.children||d.data._children)?"end":"start")
     .text(d=>d.data.id);
-
-  node.merge(nodeEnter).transition().duration(DUR)
-    .attr("transform",d=>`translate(${{d.y}},${{d.x}})`)
-    .style("opacity",1)
-    .attr("class",d=>nclass(d));
-
-  node.exit().transition().duration(DUR)
-    .attr("transform",`translate(${{src.y}},${{src.x}})`)
-    .style("opacity",0).remove();
-
-  nodes.forEach(d=>{{ d.x0=d.x; d.y0=d.y; }});
+  node.merge(ne).transition().duration(DUR).attr("transform",d=>`translate(${{d.y}},${{d.x}})`).style("opacity",1).attr("class",d=>nc(d));
+  node.exit().transition().duration(DUR).attr("transform",`translate(${{src.y}},${{src.x}})`).style("opacity",0).remove();
+  nodes.forEach(d=>{{d.x0=d.x;d.y0=d.y;}});
 }}
-
-function nclass(d) {{
-  if(d.depth===0) return "node root";
-  if(d.data.circular) return "node circular";
-  if(!d.data._children && !d.data.children) return "node leaf";
-  return d.data.children ? "node inner" : "node collapsed";
+function nc(d){{
+  if(d.depth===0)return "node root";
+  if(d.data.circular)return "node circular";
+  if(!d.data._children&&!d.data.children)return "node leaf";
+  return d.data.children?"node inner":"node collapsed";
 }}
-
-function toggle(d) {{
-  if(d.data.children) {{
-    d.data._children=d.data.children; d.data.children=null; d.children=null;
-  }} else if(d.data._children) {{
-    d.data.children=d.data._children; d.data._children=null;
-  }}
-  // rebuild from root
-  const newRoot = d3.hierarchy(rootData, n=>n.children);
-  newRoot.each(n=>{{ if(!n.x0){{n.x0=H/2;n.y0=0;}} }});
-  root.each((n,i)=>{{ const m=newRoot.descendants()[i]; if(m){{n.x0=n.x||H/2;n.y0=n.y||0;}} }});
-  Object.assign(root, d3.hierarchy(rootData, n=>n.children));
-  root.each(n=>{{ if(!n.x0){{n.x0=H/2;n.y0=0;}} }});
-  assignIds(root);
+function toggle(d){{
+  if(d.data.children){{d.data._children=d.data.children;d.data.children=null;d.children=null;}}
+  else if(d.data._children){{d.data.children=d.data._children;d.data._children=null;}}
+  const r=d3.hierarchy(rootData,n=>n.children);
+  r.each(n=>{{if(!n.x0){{n.x0=H/2;n.y0=0;}}}});Object.assign(root,r);assignIds(root);
 }}
-
-document.getElementById("btn-expand").onclick = ()=>{{
-  root.each(d=>{{ if(d.data._children){{d.data.children=d.data._children;d.data._children=null;}} }});
-  Object.assign(root, d3.hierarchy(rootData, n=>n.children));
-  root.each(n=>{{ if(!n.x0){{n.x0=H/2;n.y0=0;}} }}); assignIds(root); update(root);
+document.getElementById("btn-expand").onclick=()=>{{
+  root.each(d=>{{if(d.data._children){{d.data.children=d.data._children;d.data._children=null;}}}});
+  Object.assign(root,d3.hierarchy(rootData,n=>n.children));root.each(n=>{{if(!n.x0){{n.x0=H/2;n.y0=0;}}}});assignIds(root);update(root);
 }};
-document.getElementById("btn-collapse").onclick = ()=>{{
-  root.each(d=>{{ if(d.depth>0&&d.data.children){{d.data._children=d.data.children;d.data.children=null;}} }});
-  Object.assign(root, d3.hierarchy(rootData, n=>n.children));
-  root.each(n=>{{ if(!n.x0){{n.x0=H/2;n.y0=0;}} }}); assignIds(root); update(root);
+document.getElementById("btn-collapse").onclick=()=>{{
+  root.each(d=>{{if(d.depth>0&&d.data.children){{d.data._children=d.data.children;d.data.children=null;}}}});
+  Object.assign(root,d3.hierarchy(rootData,n=>n.children));root.each(n=>{{if(!n.x0){{n.x0=H/2;n.y0=0;}}}});assignIds(root);update(root);
 }};
-document.getElementById("btn-reset").onclick = ()=>{{
-  svg.transition().duration(400).call(zoom.transform, d3.zoomIdentity.translate(80,H/2));
-}};
-
-root.each(d=>{{ d.x0=H/2; d.y0=0; }});
-update(root);
-</script>
-</body>
-</html>"""
+document.getElementById("btn-reset").onclick=()=>svg.transition().duration(400).call(zoom.transform,d3.zoomIdentity.translate(80,H/2));
+root.each(d=>{{d.x0=H/2;d.y0=0;}});update(root);
+</script></body></html>"""
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""<style>
@@ -407,13 +353,10 @@ html,body,[data-testid="stAppViewContainer"]{background:#0d0f14!important}
 [data-testid="stSidebar"]{background:#13161b!important;border-right:1px solid #2a2f3a}
 [data-testid="stSidebar"] label,[data-testid="stSidebar"] p,
 [data-testid="stSidebar"] span,[data-testid="stSidebar"] div{color:#e2e8f0!important}
-h1,h2,h3{font-family:monospace!important;color:#4f9cf9!important}
-.stTabs [data-baseweb="tab"]{color:#8896aa;font-family:monospace;font-size:12px}
+.stTabs [data-baseweb="tab"]{color:#8896aa;font-size:12px}
 .stTabs [aria-selected="true"]{color:#4f9cf9!important;border-bottom-color:#4f9cf9!important}
-[data-testid="stTextInput"] input{background:#1a1e26!important;border-color:#353c4a!important;
-  color:#e2e8f0!important;font-family:monospace}
-.stButton button{background:#1a1e26!important;border:1px solid #353c4a!important;
-  color:#e2e8f0!important;font-family:monospace!important;font-size:11px!important}
+[data-testid="stTextInput"] input{background:#1a1e26!important;border-color:#353c4a!important;color:#e2e8f0!important;font-family:monospace}
+.stButton button{background:#1a1e26!important;border:1px solid #353c4a!important;color:#e2e8f0!important;font-size:11px!important}
 .stButton button:hover{background:#4f9cf9!important;color:#000!important;border-color:#4f9cf9!important}
 [data-testid="stExpander"]{background:#13161b!important;border:1px solid #2a2f3a!important;border-radius:6px!important}
 </style>""", unsafe_allow_html=True)
@@ -422,26 +365,26 @@ h1,h2,h3{font-family:monospace!important;color:#4f9cf9!important}
 with st.sidebar:
     st.markdown("## ⚙️ BOM/tree")
     st.divider()
+
+    # Upload
     uploaded = st.file_uploader("Upload .xlsx / .csv", type=["xlsx","xls","csv"], label_visibility="collapsed")
     if uploaded:
         sheet_choice = None
         if uploaded.name.lower().endswith(('.xlsx','.xls')):
             uploaded.seek(0)
-            xl = pd.ExcelFile(uploaded)
-            sheets = xl.sheet_names
+            sheets = pd.ExcelFile(uploaded).sheet_names
             sheet_choice = st.selectbox("Worksheet", sheets) if len(sheets)>1 else sheets[0]
             uploaded.seek(0)
         with st.expander("Column mapping", expanded=False):
-            col_map = {}
-            for field, default in DEFAULT_COL_MAP.items():
-                col_map[field] = st.number_input(FIELD_LABELS[field], min_value=0, max_value=50, value=default, key=f"cm_{field}")
-            skip_rows = st.number_input("Skip rows (header)", min_value=0, max_value=20, value=1)
+            col_map = {f: st.number_input(FIELD_LABELS[f], min_value=0, max_value=50, value=v, key=f"cm_{f}")
+                       for f, v in DEFAULT_COL_MAP.items()}
+            skip_rows = st.number_input("Skip rows", min_value=0, max_value=20, value=1)
         if st.button("⬆ Import", use_container_width=True, type="primary"):
             try:
                 uploaded.seek(0)
-                import_id, n = do_import(uploaded, col_map, skip_rows, sheet_choice)
+                iid, n = do_import(uploaded, col_map, skip_rows, sheet_choice)
                 st.success(f"✓ {n} parts imported")
-                st.session_state['active_import'] = import_id
+                st.session_state['active_import'] = iid
                 st.rerun()
             except Exception as e:
                 st.error(f"Import failed: {e}")
@@ -455,52 +398,38 @@ with st.sidebar:
         for imp in imports:
             is_active = st.session_state.get('active_import') == imp['id']
             label = f"{'▶ ' if is_active else ''}{imp['filename']}\n{imp['part_count']} parts · {imp['imported_at'][:16]}"
-            if st.button(label, key=f"imp_{imp['id']}", use_container_width=True,
-                         type="primary" if is_active else "secondary"):
-                st.session_state['active_import'] = imp['id']
-                st.rerun()
+            col_a, col_b = st.columns([5, 1])
+            with col_a:
+                if st.button(label, key=f"imp_{imp['id']}", use_container_width=True,
+                             type="primary" if is_active else "secondary"):
+                    st.session_state['active_import'] = imp['id']
+                    st.rerun()
+            with col_b:
+                if st.button("🗑", key=f"del_{imp['id']}", help="Delete"):
+                    db = get_db()
+                    db.execute("DELETE FROM parts WHERE import_id=?", (imp['id'],))
+                    db.execute("DELETE FROM imports WHERE id=?", (imp['id'],))
+                    db.commit()
+                    load_parts.clear(); list_imports.clear(); get_optimized_maps.clear()
+                    if st.session_state.get('active_import') == imp['id']:
+                        st.session_state.pop('active_import')
+                    st.rerun()
 
     st.divider()
     active_id = st.session_state.get('active_import')
-# -- Inside your Main section --
     if active_id:
-        # 1. Load maps once (cached)
-        children_map, parents_map = get_optimized_maps(active_id)
-        
-        tab_tree, tab_table = st.tabs(["🌳 Tree", "📋 Table"])
-
-        with tab_tree:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                # Use a unique key to prevent focus loss
-                part = st.text_input("Part number", key="search_input").strip().upper()
-            with col2:
-                direction = st.radio("Direction", ["Explosion ↓", "Where Used ↑"], horizontal=True)
-
-            if part:
-                active_map = children_map if "Explosion" in direction else parents_map
-                
-                # 2. Check existence in the pre-loaded map keys (much faster than SQL)
-                if part not in children_map and part not in parents_map:
-                    st.warning(f"Part {part} not found in the current import.")
-                else:
-                    # 3. Build and render
-                    tree_data = build_tree(part, active_map)
-                    tree_json = json.dumps(tree_data)
-                    components.html(
-                        make_tree_html(part, "explosion" if "Explosion" in direction else "whereused", tree_json),
-                        height=700
-                    )
-
+        if st.button("↓ Export full BOM", use_container_width=True):
+            buf, fname = export_excel(active_id)
+            st.download_button("⬇ Click to download", buf, fname,
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
 # ── Main ──────────────────────────────────────────────────────────────────────
 active_id = st.session_state.get('active_import')
-
 if not active_id:
-    st.markdown("## no bom loaded")
-    st.caption("Upload a file using the sidebar to get started.")
+    st.info("Upload and import a BOM file to get started.")
     st.stop()
 
-parts = load_parts(active_id)
+
 children_map, parents_map = get_optimized_maps(active_id)
 
 tab_tree, tab_table = st.tabs(["🌳 Tree", "📋 Table"])
@@ -509,7 +438,7 @@ with tab_tree:
     col1, col2 = st.columns([3, 1])
     with col1:
         part = st.text_input("Part number", placeholder="e.g. 0011-04827",
-                             label_visibility="collapsed").strip().upper()
+                             label_visibility="collapsed", key="search_input").strip().upper()
     with col2:
         direction = st.radio("Direction", ["Explosion ↓", "Where Used ↑"],
                              label_visibility="collapsed", horizontal=True)
@@ -517,22 +446,32 @@ with tab_tree:
     if not part:
         st.info("Enter a part number above to draw its tree.")
     else:
-        lookup = children_map if "Explosion" in direction else parents_map
-        # check exists
-        all_codes = set(p['amat_code'].upper() for p in parts)
-        if part not in all_codes:
-            # fuzzy suggest
-            suggestions = [c for c in all_codes if part in c][:8]
+        active_map = children_map if "Explosion" in direction else parents_map
+        if part not in children_map and part not in parents_map:
             st.warning(f"Part `{part}` not found.")
-            if suggestions:
-                st.caption("Did you mean: " + "  |  ".join(f"`{s}`" for s in suggestions))
         else:
-            tree_data = build_tree(part, lookup)
+            tree_data = build_tree(part, active_map)
             tree_json = json.dumps(tree_data)
-            components.html(make_tree_html(part, "explosion" if "Explosion" in direction else "whereused", tree_json),
-                            height=680, scrolling=False)
+            components.html(
+                make_tree_html(part, "explosion" if "Explosion" in direction else "whereused", tree_json),
+                height=700, scrolling=False
+            )
+            ex1, ex2 = st.columns(2)
+            with ex1:
+                if st.button("⬇ Export tree — Excel", use_container_width=True):
+                    buf = export_tree_excel(part, tree_data, direction)
+                    st.download_button("⬇ Download", buf, f"{part}_tree.xlsx",
+                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       use_container_width=True)
+            with ex2:
+                if st.button("⬇ Export tree — Text", use_container_width=True):
+                    txt = export_tree_text(part, tree_data, direction)
+                    st.download_button("⬇ Download", txt.encode(),
+                                       f"{part}_tree.txt", "text/plain",
+                                       use_container_width=True)
 
 with tab_table:
+    parts = load_parts(active_id)
     df_parts = pd.DataFrame(parts)
     if not df_parts.empty:
         cols = ['row_no','lv','amat_code','fv_code','fv_rev','amat_rev','part_name','status']
