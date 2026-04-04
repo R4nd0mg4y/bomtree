@@ -111,6 +111,8 @@ def do_import(uploaded, col_map, skip_rows, sheet):
     db.commit()
     load_parts.clear()
     list_imports.clear()
+    get_optimized_maps.clear()
+    get_parts_lookup.clear()
     return import_id, inserted
 
 @st.cache_data
@@ -153,12 +155,30 @@ def get_optimized_maps(import_id):
         stack.append((lv, code))
     return dict(children_map), dict(parents_map)
 
-def build_tree(node, lookup, visited=None):
+@st.cache_data
+def get_parts_lookup(import_id):
+    rows = get_db().execute(
+        "SELECT amat_code, part_name, fv_code, fv_rev, amat_rev, lv, status "
+        "FROM parts WHERE import_id=? ORDER BY row_no", (import_id,)
+    ).fetchall()
+    return {str(r['amat_code']).strip(): dict(r) for r in rows}
+
+def build_tree(node, lookup, visited=None, parts_lookup=None):
     if visited is None: visited = set()
     if node in visited:
         return {"id": node, "children": [], "circular": True}
     visited.add(node)
-    return {"id": node, "children": [build_tree(c, lookup, visited.copy()) for c in lookup.get(node, [])]}
+    p = (parts_lookup or {}).get(node, {})
+    return {
+        "id":       node,
+        "name":     p.get('part_name') or '',
+        "fv":       p.get('fv_code') or '',
+        "fv_rev":   p.get('fv_rev') or '',
+        "amat_rev": p.get('amat_rev') or '',
+        "lv":       p.get('lv') or '',
+        "status":   p.get('status') or '',
+        "children": [build_tree(c, lookup, visited.copy(), parts_lookup) for c in lookup.get(node, [])]
+    }
 
 # ── Exports ───────────────────────────────────────────────────────────────────
 def export_excel(import_id):
@@ -193,7 +213,16 @@ def export_excel(import_id):
 def export_tree_excel(part, tree_data, direction):
     rows = []
     def walk(node, depth=0):
-        rows.append({'Level': depth, 'Part': node['id'], 'Note': '⚠ circular' if node.get('circular') else ''})
+        rows.append({
+            'Level': depth,
+            'AMAT Code': node['id'],
+            'Part Name': node.get('name',''),
+            'FV Code': node.get('fv',''),
+            'FV Rev': node.get('fv_rev',''),
+            'AMAT Rev': node.get('amat_rev',''),
+            'Status': node.get('status',''),
+            'Note': '⚠ circular' if node.get('circular') else ''
+        })
         for child in node.get('children', []):
             walk(child, depth + 1)
     walk(tree_data)
@@ -202,32 +231,43 @@ def export_tree_excel(part, tree_data, direction):
     thin = Side(style='thin', color='FFB0BEC5')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     lv_colors = ['FFF9A825','FFFFF9C4','FFF1F8E9','FFE8F5E9','FFEDE7F6']
-    ws.append(['Level', 'Part Number', 'Note'])
+    headers = ['Level','AMAT Code','Part Name','FV Code','FV Rev','AMAT Rev','Status','Note']
+    ws.append(headers)
     for cell in ws[1]:
         cell.fill=hf; cell.font=Font(bold=True,color="FFFFFFFF",size=10)
         cell.alignment=Alignment(horizontal='center'); cell.border=border
     ws.column_dimensions['A'].width = 8
-    ws.column_dimensions['B'].width = 40
-    ws.column_dimensions['C'].width = 14
+    ws.column_dimensions['B'].width = 22
+    ws.column_dimensions['C'].width = 40
+    ws.column_dimensions['D'].width = 14
+    ws.column_dimensions['E'].width = 8
+    ws.column_dimensions['F'].width = 10
+    ws.column_dimensions['G'].width = 10
+    ws.column_dimensions['H'].width = 12
     for r in rows:
         lv = r['Level']
         fill = PatternFill("solid", fgColor=lv_colors[min(lv, 4)])
-        ws.append([lv, r['Part'], r['Note']])
+        ws.append([r['Level'], r['AMAT Code'], r['Part Name'], r['FV Code'],
+                   r['FV Rev'], r['AMAT Rev'], r['Status'], r['Note']])
         for cell in ws[ws.max_row]:
             cell.fill=fill; cell.border=border
-            if cell.column == 2:
-                cell.alignment = Alignment(indent=lv, vertical='center')
+            cell.alignment=Alignment(vertical='center',
+                                     indent=lv if cell.column == 3 else 0)
     ws.freeze_panes = 'A2'
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
 
 def export_tree_text(part, tree_data, direction):
-    lines = [f"BOM Tree — {part} — {direction}", '='*50]
-    lines.append(part)
+    lines = [f"BOM Tree — {part} — {direction}", '='*60]
+    lines.append(part + (f"  {tree_data.get('name','')}" if tree_data.get('name') else ''))
     def walk(node, prefix='', is_last=True):
         connector = '└── ' if is_last else '├── '
         flag = ' ⚠ circular' if node.get('circular') else ''
-        lines.append(prefix + connector + node['id'] + flag)
+        extra = ''
+        if node.get('fv'): extra += f"  FV:{node['fv']}"
+        if node.get('fv_rev'): extra += f" r{node['fv_rev']}"
+        if node.get('name'): extra += f"  {node['name']}"
+        lines.append(prefix + connector + node['id'] + extra + flag)
         children = node.get('children', [])
         for i, child in enumerate(children):
             walk(child, prefix + ('    ' if is_last else '│   '), i == len(children) - 1)
@@ -262,9 +302,11 @@ def make_tree_html(part, direction, tree_json):
   .node text{{font-family:monospace;font-size:11px;fill:var(--text);pointer-events:none;dominant-baseline:middle}}
   .node.root text{{font-weight:700;font-size:13px;fill:var(--accent)}}
   .link{{fill:none;stroke:var(--border);stroke-width:1.5px}}
-  #tooltip{{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:8px 14px;font-size:12px;color:var(--text);box-shadow:0 4px 20px rgba(0,0,0,.5);display:none;z-index:20}}
-  #tooltip .tp{{font-weight:700;color:var(--accent);font-size:13px}}
-  #tooltip .tm{{color:var(--muted);margin-top:4px;font-size:11px}}
+  #tooltip{{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:8px 14px;font-size:12px;color:var(--text);box-shadow:0 4px 20px rgba(0,0,0,.5);display:none;z-index:20;max-width:340px}}
+  #tooltip .tp{{font-weight:700;color:var(--accent);font-size:13px;margin-bottom:4px}}
+  #tooltip .tn{{color:var(--text);margin-bottom:4px;font-size:11px;white-space:normal;line-height:1.4}}
+  #tooltip .tm{{color:var(--muted);margin-top:2px;font-size:10px}}
+  #tooltip .tr{{color:var(--accent2);font-size:10px;margin-top:2px}}
 </style></head><body>
 <div id="toolbar">
   <span class="root-badge">{part}</span>
@@ -280,7 +322,17 @@ def make_tree_html(part, direction, tree_json):
 <script>
 const RAW = {tree_json};
 const W = window.innerWidth, H = window.innerHeight - 46, DUR = 300;
-function toH(n){{ return {{id:n.id,circular:n.circular||false,_children:n.children&&n.children.length?n.children.map(toH):null,children:null}}; }}
+
+function toH(n) {{
+  return {{
+    id: n.id, circular: n.circular||false,
+    name: n.name||'', fv: n.fv||'', fv_rev: n.fv_rev||'',
+    amat_rev: n.amat_rev||'', lv: n.lv||'', status: n.status||'',
+    _children: n.children&&n.children.length ? n.children.map(toH) : null,
+    children: null,
+  }};
+}}
+
 const rootData = toH(RAW);
 if(rootData._children){{rootData.children=rootData._children;rootData._children=null;}}
 const root = d3.hierarchy(rootData,d=>d.children);
@@ -290,11 +342,12 @@ const zoom=d3.zoom().scaleExtent([0.1,4]).on("zoom",e=>g.attr("transform",e.tran
 svg.call(zoom);
 const g=svg.append("g").attr("transform",`translate(80,${{H/2}})`);
 const linkPath=d3.linkHorizontal().x(d=>d.y).y(d=>d.x);
-const treeLayout=d3.tree().nodeSize([26,240]);
+const treeLayout=d3.tree().nodeSize([26,300]);
 let nid=0;
 function assignIds(d){{if(!d.data._uid)d.data._uid=++nid;if(d.children)d.children.forEach(assignIds);}}
 assignIds(root);
 const tip=document.getElementById("tooltip");
+
 function update(src){{
   treeLayout(root);
   let total=0,exp=0;root.each(d=>{{total++;if(d.children)exp++;}});
@@ -311,30 +364,43 @@ function update(src){{
     .on("click",(e,d)=>{{toggle(d);update(d);}})
     .on("mousemove",(e,d)=>{{
       const k=(d.data._children?.length||0)+(d.data.children?.length||0);
-      tip.innerHTML=`<div class="tp">${{d.data.id}}</div><div class="tm">depth ${{d.depth}} · ${{k}} children</div><div class="tm">${{d.data.circular?"⚠ circular":d.data.children?"click to collapse":d.data._children?"click to expand":"leaf"}}</div>`;
+      tip.innerHTML=`
+        <div class="tp">${{d.data.id}}</div>
+        ${{d.data.name?`<div class="tn">${{d.data.name}}</div>`:''}}
+        ${{d.data.fv?`<div class="tm">FV: ${{d.data.fv}}${{d.data.fv_rev?' · rev '+d.data.fv_rev:''}}</div>`:''}}
+        ${{d.data.amat_rev?`<div class="tm">AMAT rev: ${{d.data.amat_rev}}</div>`:''}}
+        ${{d.data.status?`<div class="tm">Status: ${{d.data.status}}</div>`:''}}
+        <div class="tm">L${{d.data.lv}} · depth ${{d.depth}} · ${{k}} children</div>
+        <div class="tr">${{d.data.circular?"⚠ circular ref":d.data.children?"click to collapse":d.data._children?"click to expand":"leaf node"}}</div>`;
       tip.style.display="block";tip.style.left=(e.pageX+14)+"px";tip.style.top=(e.pageY-14)+"px";
     }}).on("mouseleave",()=>tip.style.display="none");
   ne.append("circle").attr("r",7);
   ne.append("text").attr("dy","0.31em")
     .attr("x",d=>(d.data.children||d.data._children)?-14:14)
     .attr("text-anchor",d=>(d.data.children||d.data._children)?"end":"start")
-    .text(d=>d.data.id);
+    .text(d=>{{
+      const name = d.data.name ? '  ' + d.data.name.slice(0,0)+(d.data.name.length>28?'…':'') : '';
+      return d.data.id + name;
+    }});
   node.merge(ne).transition().duration(DUR).attr("transform",d=>`translate(${{d.y}},${{d.x}})`).style("opacity",1).attr("class",d=>nc(d));
   node.exit().transition().duration(DUR).attr("transform",`translate(${{src.y}},${{src.x}})`).style("opacity",0).remove();
   nodes.forEach(d=>{{d.x0=d.x;d.y0=d.y;}});
 }}
+
 function nc(d){{
   if(d.depth===0)return "node root";
   if(d.data.circular)return "node circular";
   if(!d.data._children&&!d.data.children)return "node leaf";
   return d.data.children?"node inner":"node collapsed";
 }}
+
 function toggle(d){{
   if(d.data.children){{d.data._children=d.data.children;d.data.children=null;d.children=null;}}
   else if(d.data._children){{d.data.children=d.data._children;d.data._children=null;}}
   const r=d3.hierarchy(rootData,n=>n.children);
   r.each(n=>{{if(!n.x0){{n.x0=H/2;n.y0=0;}}}});Object.assign(root,r);assignIds(root);
 }}
+
 document.getElementById("btn-expand").onclick=()=>{{
   root.each(d=>{{if(d.data._children){{d.data.children=d.data._children;d.data._children=null;}}}});
   Object.assign(root,d3.hierarchy(rootData,n=>n.children));root.each(n=>{{if(!n.x0){{n.x0=H/2;n.y0=0;}}}});assignIds(root);update(root);
@@ -366,7 +432,6 @@ with st.sidebar:
     st.markdown("## ⚙️ BOM/tree")
     st.divider()
 
-    # Upload
     uploaded = st.file_uploader("Upload .xlsx / .csv", type=["xlsx","xls","csv"], label_visibility="collapsed")
     if uploaded:
         sheet_choice = None
@@ -410,7 +475,8 @@ with st.sidebar:
                     db.execute("DELETE FROM parts WHERE import_id=?", (imp['id'],))
                     db.execute("DELETE FROM imports WHERE id=?", (imp['id'],))
                     db.commit()
-                    load_parts.clear(); list_imports.clear(); get_optimized_maps.clear()
+                    load_parts.clear(); list_imports.clear()
+                    get_optimized_maps.clear(); get_parts_lookup.clear()
                     if st.session_state.get('active_import') == imp['id']:
                         st.session_state.pop('active_import')
                     st.rerun()
@@ -423,12 +489,12 @@ with st.sidebar:
             st.download_button("⬇ Click to download", buf, fname,
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 active_id = st.session_state.get('active_import')
 if not active_id:
     st.info("Upload and import a BOM file to get started.")
     st.stop()
-
 
 children_map, parents_map = get_optimized_maps(active_id)
 
@@ -450,7 +516,8 @@ with tab_tree:
         if part not in children_map and part not in parents_map:
             st.warning(f"Part `{part}` not found.")
         else:
-            tree_data = build_tree(part, active_map)
+            parts_lookup = get_parts_lookup(active_id)
+            tree_data = build_tree(part, active_map, parts_lookup=parts_lookup)
             tree_json = json.dumps(tree_data)
             components.html(
                 make_tree_html(part, "explosion" if "Explosion" in direction else "whereused", tree_json),
@@ -460,13 +527,13 @@ with tab_tree:
             with ex1:
                 if st.button("⬇ Export tree — Excel", use_container_width=True):
                     buf = export_tree_excel(part, tree_data, direction)
-                    st.download_button("⬇ Download", buf, f"{part}_tree.xlsx",
+                    st.download_button("⬇ Download Excel", buf, f"{part}_tree.xlsx",
                                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                        use_container_width=True)
             with ex2:
                 if st.button("⬇ Export tree — Text", use_container_width=True):
                     txt = export_tree_text(part, tree_data, direction)
-                    st.download_button("⬇ Download", txt.encode(),
+                    st.download_button("⬇ Download Text", txt.encode(),
                                        f"{part}_tree.txt", "text/plain",
                                        use_container_width=True)
 
